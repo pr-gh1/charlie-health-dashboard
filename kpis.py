@@ -96,7 +96,20 @@ def weekly_rollup(sessions_df, patients_df, payor=None):
         opt_attended=("attended", "sum"),
     ).reset_index()
 
+    # Distinct headcount, not a session count or a rate -- "patients attending
+    # IOP" answers a different question than iop_attended (session volume) or
+    # iop_attendance_rate (a ratio). 10 patients attending once each and 2
+    # patients attending five times each look identical in session counts;
+    # this is what tells them apart.
+    iop_patients = (
+        s[(s.session_type == "IOP") & (s.attended == 1)]
+        .groupby("week")["patient_id"].nunique()
+        .reset_index(name="iop_patients")
+    )
+
     weekly = weekly.merge(iop, on="week", how="left").merge(opt, on="week", how="left")
+    weekly = weekly.merge(iop_patients, on="week", how="left")
+    weekly["iop_patients"] = weekly["iop_patients"].fillna(0).astype(int)
     weekly["attendance_rate"] = weekly["attended_sessions"] / weekly["scheduled_sessions"]
     weekly["iop_attendance_rate"] = weekly["iop_attended"] / weekly["iop_scheduled"]
     weekly["opt_attendance_rate"] = weekly["opt_attended"] / weekly["opt_scheduled"]
@@ -142,6 +155,7 @@ def trailing_window_stats(sessions_df, patients_df, window_days, payor=None, as_
     opt = win[win.session_type == "OPT"]
     iop_scheduled, iop_attended = len(iop), int(iop["attended"].sum())
     opt_scheduled, opt_attended = len(opt), int(opt["attended"].sum())
+    iop_patient_count = int(iop[iop.attended == 1]["patient_id"].nunique())
     revenue = float(win["revenue"].sum())
     iop_revenue = float(iop["revenue"].sum())
 
@@ -155,6 +169,7 @@ def trailing_window_stats(sessions_df, patients_df, window_days, payor=None, as_
         "payor": payor or "All",
         "patients_in_treatment": patients_in_treatment,
         "new_admissions": new_admissions,
+        "iop_patients": iop_patient_count,
         "iop_attendance_rate": round(iop_attended / iop_scheduled, 3) if iop_scheduled else None,
         "opt_attendance_rate": round(opt_attended / opt_scheduled, 3) if opt_scheduled else None,
         "billable_iop_sessions": iop_attended,
@@ -162,6 +177,60 @@ def trailing_window_stats(sessions_df, patients_df, window_days, payor=None, as_
         "avg_daily_revenue": round(revenue / window_days, 2),
         "total_revenue": round(revenue, 2),
     }
+
+
+DEFAULT_INACTIVITY_DAYS = 14
+
+
+def classify_episodes(patients_df, sessions_df, inactivity_days=DEFAULT_INACTIVITY_DAYS):
+    """Splits patients into 'completed' vs 'active' episodes based on how
+    recently their last session was, relative to the newest date in the
+    data. This matters for LOS specifically: a patient who's still actively
+    attending doesn't have a finished LOS yet, just a still-running clock,
+    and folding their current tenure into an LOS average biases recent
+    numbers down for no clinical reason -- they haven't left early, the
+    data just hasn't caught up to them yet.
+
+    `inactivity_days` is a heuristic, not a real discharge flag (the source
+    data doesn't have one) -- a typical IOP patient attends several times a
+    week, so ~2 weeks with no session is a reasonable "probably done" signal.
+    """
+    max_date = sessions_df["date"].max()
+    cutoff = max_date - pd.Timedelta(days=inactivity_days)
+    p = patients_df.copy()
+    p["episode_status"] = "active"
+    p.loc[p["last_session_date"] < cutoff, "episode_status"] = "completed"
+    return p
+
+
+def los_by_discharge_month(sessions_df, patients_df, payor=None, inactivity_days=DEFAULT_INACTIVITY_DAYS):
+    """Avg LOS trended by discharge month, completed episodes only -- see
+    classify_episodes() for why active (still-running) episodes are
+    excluded rather than averaged in."""
+    p = filter_patients(classify_episodes(patients_df, sessions_df, inactivity_days), payor)
+    completed = p[p["episode_status"] == "completed"].copy()
+    if completed.empty:
+        return pd.DataFrame(columns=["discharge_month", "avg_los_weeks", "patients"])
+    completed["discharge_month"] = completed["last_session_date"].dt.to_period("M").dt.to_timestamp()
+    monthly = completed.groupby("discharge_month").agg(
+        avg_los_weeks=("los_weeks", "mean"),
+        patients=("patient_id", "count"),
+    ).reset_index()
+    monthly["avg_los_weeks"] = monthly["avg_los_weeks"].round(1)
+    return monthly.sort_values("discharge_month")
+
+
+def active_patient_stats(sessions_df, patients_df, payor=None, inactivity_days=DEFAULT_INACTIVITY_DAYS):
+    """Count and avg tenure-so-far of patients still in an active episode --
+    context alongside the LOS trend, deliberately not part of the LOS
+    average itself."""
+    p = filter_patients(classify_episodes(patients_df, sessions_df, inactivity_days), payor)
+    active = p[p["episode_status"] == "active"]
+    if active.empty:
+        return {"count": 0, "avg_tenure_weeks": None}
+    max_date = sessions_df["date"].max()
+    tenure_weeks = (max_date - active["first_session_date"]).dt.days / 7
+    return {"count": int(len(active)), "avg_tenure_weeks": round(float(tenure_weeks.mean()), 1)}
 
 
 def payor_composition(sessions_df, patients_df):

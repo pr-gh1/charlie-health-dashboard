@@ -8,7 +8,8 @@ computes the Part 1 KPIs, and lays them out around a specific usage
 narrative rather than a flat grid of every possible chart:
 
   1. Snapshot  -- is right now normal? (L7D/L1M/L3M KPI tiles)
-  2. Trend     -- how did we get here? (2 grouped chart pairs, single axis)
+  2. Trend     -- how did we get here? (census/attendance, revenue/billing,
+     and LOS-by-discharge-cohort, single axis throughout)
   3. Composition -- who are we treating? (LOS distribution, payor mix)
   4. Narrative -- LLM synthesis of the above, plus a chat that can query
      the real data (not just the aggregates already on screen), plus a
@@ -30,7 +31,9 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from transform_attendance import load_grid, parse_grid, write_workbook, RAW_SHEET_DEFAULT
-from kpis import build_frames, weekly_rollup, summary_stats, trailing_window_stats, payor_composition, WINDOWS
+from kpis import (build_frames, weekly_rollup, summary_stats, trailing_window_stats,
+                   payor_composition, los_by_discharge_month, active_patient_stats,
+                   WINDOWS, DEFAULT_INACTIVITY_DAYS)
 from chat_tools import answer_question
 from snapshot_store import load_last_snapshot, save_snapshot, compute_diff, llm_change_summary
 
@@ -227,12 +230,13 @@ win = trailing_window_stats(
     payor=None if payor_filter == "All" else payor_filter,
 )
 
-c1, c2, c3, c4, c5 = st.columns(5)
+c1, c2, c3, c4, c5, c6 = st.columns(6)
 c1.metric("Patients in treatment", win["patients_in_treatment"])
-c2.metric("New admissions", win["new_admissions"])
-c3.metric("IOP attendance rate", f"{win['iop_attendance_rate']:.1%}" if win["iop_attendance_rate"] is not None else "—")
-c4.metric("Billable IOP sessions", win["billable_iop_sessions"])
-c5.metric("Avg daily revenue", f"${win['avg_daily_revenue']:,.0f}")
+c2.metric("Patients attending IOP", win["iop_patients"])
+c3.metric("New admissions", win["new_admissions"])
+c4.metric("IOP attendance rate", f"{win['iop_attendance_rate']:.1%}" if win["iop_attendance_rate"] is not None else "—")
+c5.metric("Billable IOP sessions", win["billable_iop_sessions"])
+c6.metric("Avg daily revenue", f"${win['avg_daily_revenue']:,.0f}")
 st.caption(f"{window_label} · {win['start']} to {win['end']} · {payor_filter} payor")
 
 st.divider()
@@ -247,8 +251,16 @@ st.subheader("Trend")
 st.markdown("**Census & attendance** -- is the clinical engine healthy?")
 col_a, col_b = st.columns(2)
 with col_a:
-    fig = line_chart(weekly_df, "week", [("patients_in_treatment", "Patients in treatment", "#2a78d6", None, "lines")], "Patients")
+    fig = line_chart(weekly_df, "week", [
+        ("patients_in_treatment", "In treatment (any service)", "#2a78d6", None, "lines"),
+        ("iop_patients", "Attending IOP", "#5dcaa5", "dash", "lines"),
+    ], "Patients")
     st.plotly_chart(fig, width="stretch")
+    st.caption(
+        "Any gap between the two lines is patients active on OPT only that "
+        "week -- e.g. IOP alumni stepping down, or someone between IOP "
+        "blocks."
+    )
 with col_b:
     fig = line_chart(weekly_df, "week", [
         ("iop_attendance_rate", "IOP", "#2a78d6", None, "lines"),
@@ -269,6 +281,24 @@ with col_c:
 with col_d:
     fig = line_chart(weekly_df, "week", [("revenue", "Revenue", "#1baf7a", None, "lines")], "Revenue ($)")
     st.plotly_chart(fig, width="stretch")
+
+st.markdown("**Length of stay** -- are completed episodes getting longer or shorter?")
+los_payor = None if payor_filter == "All" else payor_filter
+los_trend = los_by_discharge_month(sessions_df, patients_df, payor=los_payor)
+active_stats = active_patient_stats(sessions_df, patients_df, payor=los_payor)
+if los_trend.empty:
+    st.caption("Not enough completed episodes yet to trend LOS.")
+else:
+    fig = bar_chart(los_trend, "discharge_month", "avg_los_weeks", "Avg LOS at discharge (weeks)", color="#7f77dd")
+    st.plotly_chart(fig, width="stretch")
+    st.caption(
+        f"Completed episodes only (last session {DEFAULT_INACTIVITY_DAYS}+ days before the data's most "
+        f"recent date) -- a patient still actively attending doesn't have a "
+        f"finished LOS yet, so including them would bias recent months down. "
+        f"Separately: {active_stats['count']} patients are currently active"
+        + (f", averaging {active_stats['avg_tenure_weeks']} weeks so far (not "
+           f"included in the chart above)." if active_stats["count"] else ".")
+    )
 
 st.divider()
 
