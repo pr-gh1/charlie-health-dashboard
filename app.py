@@ -377,7 +377,12 @@ with tab_summary:
                     )
                     resp = client.messages.create(model=get_model_name(), max_tokens=600,
                                                     messages=[{"role": "user", "content": prompt}])
-                    st.session_state["insights_text"] = resp.content[0].text
+                    # Filter to text blocks -- some models can return non-text
+                    # blocks (e.g. thinking) ahead of the actual answer, and
+                    # content[0] isn't reliably the text block.
+                    st.session_state["insights_text"] = "".join(
+                        b.text for b in resp.content if getattr(b, "type", None) == "text"
+                    )
                 except Exception as e:
                     st.error(f"Insight generation failed: {e}")
         if "insights_text" in st.session_state:

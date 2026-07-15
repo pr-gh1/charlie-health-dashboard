@@ -140,4 +140,7 @@ def llm_change_summary(client, model, diff, current_stats):
         "CURRENT STATS:\n" + json.dumps(current_stats, indent=2, default=str)
     )
     resp = client.messages.create(model=model, max_tokens=500, messages=[{"role": "user", "content": prompt}])
-    return resp.content[0].text
+    # Some models may return non-text content blocks (e.g. thinking) ahead of
+    # the actual text -- filter to text blocks specifically rather than
+    # assuming content[0] is text.
+    return "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
