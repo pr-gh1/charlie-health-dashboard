@@ -27,11 +27,12 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
 from transform_attendance import load_grid, parse_grid, write_workbook, RAW_SHEET_DEFAULT
-from kpis import (build_frames, weekly_rollup, summary_stats, trailing_window_stats,
+from kpis import (build_frames, weekly_rollup, monthly_rollup, summary_stats, trailing_window_stats,
                    payor_composition, los_by_discharge_month, active_patient_stats,
                    WINDOWS, DEFAULT_INACTIVITY_DAYS)
 from chat_tools import answer_question
@@ -104,6 +105,61 @@ def cached_previous_snapshot(file_bytes: bytes, filename: str, gist_id: str):
     # per distinct upload, not on every widget interaction rerun.
     token, gid = get_github_secrets()
     return load_last_snapshot(token, gid)
+
+
+@st.cache_data(show_spinner=False)
+def load_forecast_baseline():
+    """Frozen N24M forecast (base case + growth case), generated once from
+    N24M_Revenue_Projection.xlsx and checked into the repo -- see
+    extract_n24m_baseline.py. In production this file would be regenerated
+    by Finance on a regular cadence, not on every dashboard load; the
+    dashboard's job is to compare actuals against whatever baseline is
+    currently checked in, not to re-run the forecast itself.
+    """
+    path = Path(__file__).parent / "forecast" / "n24m_baseline.json"
+    if not path.exists():
+        return None
+    return json.loads(path.read_text())
+
+
+def forecast_window_estimate(forecast, scenario_key, metric_key, start, end):
+    """Day-weighted proration of a monthly forecast baseline onto an
+    arbitrary [start, end] window, so a trailing L7D/L1M/L3M snapshot window
+    (which rarely lines up with calendar month boundaries) can still be
+    compared against the monthly N24M model. `census` is an intensity
+    metric so overlapping days are averaged (weighted by days contributed);
+    `admits`/`total_revenue` are flow metrics so each month's total is
+    prorated by the fraction of that month falling inside the window, then
+    summed across every month the window touches. Returns None if the
+    window falls entirely outside the forecast horizon (e.g. the base
+    sample dataset, which ends the day before the forecast starts).
+    """
+    scenario = forecast[scenario_key]
+    months = forecast["months"]
+    is_intensity = metric_key == "census"
+    weighted_sum, weight_total, total, any_data = 0.0, 0, 0.0, False
+
+    for i, m in enumerate(months):
+        m_start = pd.Timestamp(m + "-01")
+        m_end = m_start + pd.offsets.MonthEnd(1)
+        overlap_start, overlap_end = max(start, m_start), min(end, m_end)
+        if overlap_start > overlap_end:
+            continue
+        days = (overlap_end - overlap_start).days + 1
+        val = scenario.get(metric_key, [None] * len(months))[i]
+        if val is None:
+            continue
+        any_data = True
+        if is_intensity:
+            weighted_sum += val * days
+            weight_total += days
+        else:
+            days_in_month = (m_end - m_start).days + 1
+            total += val * (days / days_in_month)
+
+    if not any_data:
+        return None
+    return weighted_sum / weight_total if is_intensity else total
 
 
 # ---------------------------------------------------------------------------
@@ -225,19 +281,80 @@ st.divider()
 
 st.subheader("Snapshot")
 window_label = st.radio("Window", list(WINDOWS.keys()), index=0, horizontal=True, label_visibility="collapsed")
-win = trailing_window_stats(
-    sessions_df, patients_df, WINDOWS[window_label],
-    payor=None if payor_filter == "All" else payor_filter,
-)
+snap_payor = None if payor_filter == "All" else payor_filter
+window_days = WINDOWS[window_label]
+win = trailing_window_stats(sessions_df, patients_df, window_days, payor=snap_payor)
 
+# Prior period = the immediately preceding window of the same length
+# (non-overlapping), so L7D compares to the L7D right before it, L1M to
+# the L1M right before that, etc. -- a like-for-like "is this normal"
+# reference that doesn't require a second dataset to be loaded.
+prev_end = pd.Timestamp(win["start"]) - pd.Timedelta(days=1)
+prev = trailing_window_stats(sessions_df, patients_df, window_days, payor=snap_payor, as_of=prev_end)
+
+forecast = load_forecast_baseline()
+win_start_ts, win_end_ts = pd.Timestamp(win["start"]), pd.Timestamp(win["end"])
+fc_census = fc_admits = fc_revenue = None
+if forecast is not None:
+    fc_census = forecast_window_estimate(forecast, "base_case", "census", win_start_ts, win_end_ts)
+    fc_admits = forecast_window_estimate(forecast, "base_case", "admits", win_start_ts, win_end_ts)
+    fc_revenue = forecast_window_estimate(forecast, "base_case", "total_revenue", win_start_ts, win_end_ts)
+fc_avg_daily_revenue = fc_revenue / window_days if fc_revenue is not None else None
+
+def _delta(cur, prior, pct=False, pp=False):
+    if cur is None or prior is None:
+        return None
+    d = cur - prior
+    if pp:
+        return f"{d * 100:+.1f}pp"
+    if pct and prior:
+        return f"{d:+,.0f} ({d / prior:+.0%})"
+    return f"{d:+,.0f}"
+
+st.caption("**vs. prior period** -- same-length window immediately before this one")
 c1, c2, c3, c4, c5, c6 = st.columns(6)
-c1.metric("Patients in treatment", win["patients_in_treatment"])
-c2.metric("Patients attending IOP", win["iop_patients"])
-c3.metric("New admissions", win["new_admissions"])
-c4.metric("IOP attendance rate", f"{win['iop_attendance_rate']:.1%}" if win["iop_attendance_rate"] is not None else "—")
-c5.metric("Billable IOP sessions", win["billable_iop_sessions"])
-c6.metric("Avg daily revenue", f"${win['avg_daily_revenue']:,.0f}")
+c1.metric("Patients in treatment", win["patients_in_treatment"],
+          delta=_delta(win["patients_in_treatment"], prev["patients_in_treatment"]))
+c2.metric("Patients attending IOP", win["iop_patients"],
+          delta=_delta(win["iop_patients"], prev["iop_patients"]))
+c3.metric("New admissions", win["new_admissions"],
+          delta=_delta(win["new_admissions"], prev["new_admissions"]))
+c4.metric("IOP attendance rate",
+          f"{win['iop_attendance_rate']:.1%}" if win["iop_attendance_rate"] is not None else "—",
+          delta=_delta(win["iop_attendance_rate"], prev["iop_attendance_rate"], pp=True))
+c5.metric("Billable IOP sessions", win["billable_iop_sessions"],
+          delta=_delta(win["billable_iop_sessions"], prev["billable_iop_sessions"]))
+c6.metric("Avg daily revenue", f"${win['avg_daily_revenue']:,.0f}",
+          delta=_delta(win["avg_daily_revenue"], prev["avg_daily_revenue"]))
 st.caption(f"{window_label} · {win['start']} to {win['end']} · {payor_filter} payor")
+
+st.caption(
+    "**vs. base-case forecast** -- N24M model expectation for this same window "
+    "(revenue-only scope, so it only covers the metrics the model actually "
+    "projects)"
+)
+if forecast is None:
+    st.caption("No forecast baseline found.")
+elif fc_census is None:
+    st.caption(
+        "This window falls before the forecast horizon starts "
+        f"({forecast['months'][0]}) -- upload the April or September test "
+        "dataset (sidebar) to see a window that overlaps it."
+    )
+else:
+    d1, d2, d3 = st.columns(3)
+    d1.metric("Patients in treatment", win["patients_in_treatment"],
+              delta=_delta(win["patients_in_treatment"], fc_census))
+    d2.metric("New admissions", win["new_admissions"],
+              delta=_delta(win["new_admissions"], fc_admits))
+    d3.metric("Avg daily revenue", f"${win['avg_daily_revenue']:,.0f}",
+              delta=_delta(win["avg_daily_revenue"], fc_avg_daily_revenue))
+    st.caption(
+        "Patients attending IOP, IOP attendance rate, and billable IOP "
+        "sessions have no counterpart in the N24M model (it projects "
+        "census and revenue, not attendance behavior) -- the prior-period "
+        "row above is the trend read for those."
+    )
 
 st.divider()
 
@@ -342,7 +459,102 @@ st.divider()
 
 
 # ---------------------------------------------------------------------------
-# 4. Narrative: KPI summary, what-changed diff, and chat
+# 4. Forecast: actuals vs. the N24M revenue projection
+# ---------------------------------------------------------------------------
+
+st.subheader("Forecast")
+
+# `forecast` already loaded above, in Snapshot -- reused here as-is.
+if forecast is None:
+    st.info(
+        "No forecast baseline found (forecast/n24m_baseline.json). This "
+        "section compares actuals against the N24M revenue projection "
+        "model once that file is present."
+    )
+else:
+    st.caption(
+        f"Baseline: N24M_Revenue_Projection.xlsx, frozen as of "
+        f"{forecast['baseline_cutoff']} and checked into the repo -- not "
+        f"re-forecast on every load. In production this file would be "
+        f"regenerated by Finance on a regular cadence (e.g. monthly) as "
+        f"actuals land in blob storage, the same way the underlying "
+        f"attendance export would auto-refresh rather than requiring a "
+        f"manual upload. This view is always blended across payors, "
+        f"regardless of the Payor filter above, since the forecast itself "
+        f"doesn't split census/revenue by payor at the output level."
+    )
+
+    monthly_all = monthly_rollup(sessions_df, patients_df, payor=None)
+    monthly_all = monthly_all.rename(columns={"month_label": "month_str"})
+
+    fc_months = forecast["months"]
+    base = forecast["base_case"]
+    growth = forecast["growth_case"]
+
+    plot_df = pd.DataFrame({
+        "month": fc_months,
+        "base_revenue": base["total_revenue"],
+        "growth_revenue": growth["total_revenue"],
+        "base_census": base["census"],
+        "growth_census": growth["census"],
+    })
+    plot_df = plot_df.merge(
+        monthly_all[["month_str", "revenue", "census"]].rename(
+            columns={"month_str": "month", "revenue": "actual_revenue", "census": "actual_census"}
+        ),
+        on="month", how="left",
+    )
+    plot_df["variance_revenue"] = plot_df["actual_revenue"] - plot_df["base_revenue"]
+
+    n_actual = plot_df["actual_revenue"].notna().sum()
+    if n_actual == 0:
+        st.caption(
+            "No actuals fall inside the forecast window (Apr 2021 onward) "
+            "yet -- the base sample dataset runs Aug 2020-Mar 2021, right "
+            "up to the forecast's start. Upload the April or September "
+            "test dataset (sidebar) to see actuals plotted against the "
+            "forecast a month or five months into the projection period."
+        )
+
+    col_fc1, col_fc2 = st.columns(2)
+    with col_fc1:
+        st.markdown("**Revenue -- actual vs. forecast**")
+        fig = line_chart(plot_df, "month", [
+            ("actual_revenue", "Actual", "#1baf7a", None, "lines+markers"),
+            ("base_revenue", "Base case", "#2a78d6", "dash", "lines"),
+            ("growth_revenue", "Growth case (+2 reps)", "#7f77dd", "dot", "lines"),
+        ], "Revenue ($)")
+        st.plotly_chart(fig, width="stretch")
+    with col_fc2:
+        st.markdown("**Census -- actual vs. forecast**")
+        fig = line_chart(plot_df, "month", [
+            ("actual_census", "Actual", "#1baf7a", None, "lines+markers"),
+            ("base_census", "Base case", "#2a78d6", "dash", "lines"),
+            ("growth_census", "Growth case (+2 reps)", "#7f77dd", "dot", "lines"),
+        ], "Patients in treatment")
+        st.plotly_chart(fig, width="stretch")
+
+    if n_actual > 0:
+        st.markdown("**Revenue variance vs. base case** -- actual minus base-case forecast, by month")
+        variance_df = plot_df[plot_df["actual_revenue"].notna()]
+        fig = bar_chart(
+            variance_df, "month", "variance_revenue", "Variance ($)",
+            color="#1baf7a",
+        )
+        st.plotly_chart(fig, width="stretch")
+        st.caption(
+            "Positive = ahead of the base-case forecast; negative = behind "
+            "it. Compared against base case (not growth case) since the "
+            "rep-headcount increase behind the growth case hasn't actually "
+            "been executed against yet -- base case is the fairer bar for "
+            "'are we tracking as expected' until that changes."
+        )
+
+st.divider()
+
+
+# ---------------------------------------------------------------------------
+# 5. Narrative: KPI summary, what-changed diff, and chat
 # ---------------------------------------------------------------------------
 
 st.subheader("Narrative")

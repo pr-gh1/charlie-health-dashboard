@@ -135,6 +135,36 @@ def weekly_rollup(sessions_df, patients_df, payor=None):
     return weekly.sort_values("week").reset_index(drop=True)
 
 
+def monthly_rollup(sessions_df, patients_df, payor=None):
+    """One row per calendar month -- census (avg patients in treatment) and
+    revenue (IOP/OPT/total), same shape/grain as the N24M forecast baseline
+    so actuals can be plotted directly against it. Census is an average of
+    the weekly in-treatment headcount within the month (the forecast's
+    census figure is likewise a within-month average, not a point-in-time
+    snapshot), so the two are comparable rather than apples-to-oranges.
+    """
+    weekly = weekly_rollup(sessions_df, patients_df, payor=payor)
+    if weekly.empty:
+        return weekly.assign(month=[])
+
+    s = filter_sessions(sessions_df, payor).copy()
+    s["month"] = s["date"].dt.to_period("M").dt.to_timestamp()
+
+    monthly = s.groupby("month").agg(revenue=("revenue", "sum")).reset_index()
+    iop = s[s.session_type == "IOP"].groupby("month").agg(iop_revenue=("revenue", "sum")).reset_index()
+    opt = s[s.session_type == "OPT"].groupby("month").agg(opt_revenue=("revenue", "sum")).reset_index()
+    monthly = monthly.merge(iop, on="month", how="left").merge(opt, on="month", how="left")
+    monthly[["iop_revenue", "opt_revenue"]] = monthly[["iop_revenue", "opt_revenue"]].fillna(0)
+
+    w = weekly.copy()
+    w["month"] = w["week"].dt.to_period("M").dt.to_timestamp()
+    census = w.groupby("month")["patients_in_treatment"].mean().reset_index(name="census")
+
+    monthly = monthly.merge(census, on="month", how="left")
+    monthly["month_label"] = monthly["month"].dt.strftime("%Y-%m")
+    return monthly.sort_values("month").reset_index(drop=True)
+
+
 WINDOWS = {"L7D": 7, "L1M": 30, "L3M": 90}
 
 
