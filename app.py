@@ -195,29 +195,37 @@ def bar_chart(df, x_col, y_col, y_title, color="#2a78d6"):
 # Sidebar: data source + global filter
 # ---------------------------------------------------------------------------
 
+DATA_DIR = Path(__file__).parent
+PRESETS = {
+    "Base data (Mar 2021, no forecast overlap)": DATA_DIR / "sample_data" / "sample_attendance_export.xlsx",
+    "April (+1 month vs. forecast)": DATA_DIR / "test_data" / "sample_attendance_export_v2_april.xlsx",
+    "September (+6 months vs. forecast)": DATA_DIR / "test_data" / "sample_attendance_export_v3_september.xlsx",
+}
+
 st.sidebar.title("Data source")
-uploaded = st.sidebar.file_uploader(
-    "Upload Attendance & Billing export", type=["xlsx", "xlsm", "txt", "csv", "tsv"]
+st.sidebar.caption(
+    "In production these would auto-refresh from a blob store as new "
+    "exports land, rather than being picked here -- these three are "
+    "checked-in snapshots standing in for that: today's data, one month "
+    "out, and six months out, so you can see how actuals track against "
+    "the N24M forecast at different points in the projection window."
 )
-use_sample = st.sidebar.button("Use sample Charlie Health data")
+preset_choice = st.sidebar.radio("Preset dataset", list(PRESETS.keys()), index=0)
+uploaded = st.sidebar.file_uploader(
+    "...or upload your own Attendance & Billing export",
+    type=["xlsx", "xlsm", "txt", "csv", "tsv"],
+)
 
-if "active_file" not in st.session_state:
-    st.session_state.active_file = None
-
+# Precedence: an explicit upload always wins (and keeps winning across
+# reruns, since Streamlit's file_uploader holds the file until it's
+# cleared); otherwise whichever preset is selected in the radio above
+# drives the dashboard. This is also what makes the app usable with zero
+# clicks -- the radio defaults to Base data, so first load just works.
 if uploaded is not None:
     st.session_state.active_file = (uploaded.getvalue(), uploaded.name)
-elif use_sample:
-    sample_path = Path(__file__).parent / "sample_data" / "sample_attendance_export.xlsx"
-    st.session_state.active_file = (sample_path.read_bytes(), sample_path.name)
-
-if st.session_state.active_file is None:
-    st.title("Charlie Health -- Attendance & Billing Dashboard")
-    st.info(
-        "Upload an Attendance & Billing export in the sidebar (.xlsx, or a "
-        "delimited .txt/.csv of the same layout), or click **Use sample "
-        "Charlie Health data** to see it with the case study dataset."
-    )
-    st.stop()
+else:
+    preset_path = PRESETS[preset_choice]
+    st.session_state.active_file = (preset_path.read_bytes(), preset_path.name)
 
 file_bytes, filename = st.session_state.active_file
 
