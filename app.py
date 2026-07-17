@@ -198,17 +198,16 @@ def bar_chart(df, x_col, y_col, y_title, color="#2a78d6"):
 DATA_DIR = Path(__file__).parent
 PRESETS = {
     "Base data (Mar 2021, no forecast overlap)": DATA_DIR / "sample_data" / "sample_attendance_export.xlsx",
-    "April (+1 month vs. forecast)": DATA_DIR / "test_data" / "sample_attendance_export_v2_april.xlsx",
     "September (+6 months vs. forecast)": DATA_DIR / "test_data" / "sample_attendance_export_v3_september.xlsx",
 }
 
 st.sidebar.title("Data source")
 st.sidebar.caption(
     "In production these would auto-refresh from a blob store as new "
-    "exports land, rather than being picked here -- these three are "
-    "checked-in snapshots standing in for that: today's data, one month "
-    "out, and six months out, so you can see how actuals track against "
-    "the N24M forecast at different points in the projection window."
+    "exports land, rather than being picked here -- these two are "
+    "checked-in snapshots standing in for that: today's data, and six "
+    "months out, so you can see how actuals track against the N24M "
+    "forecast partway through the projection window."
 )
 preset_choice = st.sidebar.radio("Preset dataset", list(PRESETS.keys()), index=0)
 uploaded = st.sidebar.file_uploader(
@@ -346,8 +345,8 @@ if forecast is None:
 elif fc_census is None:
     st.caption(
         "This window falls before the forecast horizon starts "
-        f"({forecast['months'][0]}) -- upload the April or September test "
-        "dataset (sidebar) to see a window that overlaps it."
+        f"({forecast['months'][0]}) -- switch to the September preset "
+        "(sidebar) to see a window that overlaps it."
     )
 else:
     d1, d2, d3 = st.columns(3)
@@ -526,9 +525,9 @@ else:
         st.caption(
             "No actuals fall inside the forecast window (Apr 2021 onward) "
             "yet -- the base sample dataset runs Aug 2020-Mar 2021, right "
-            "up to the forecast's start. Switch to the April or September "
-            "preset (sidebar) to see actuals plotted against the forecast "
-            "a few weeks or several months into the projection period."
+            "up to the forecast's start. Switch to the September preset "
+            "(sidebar) to see actuals plotted against the forecast six "
+            "months into the projection period."
         )
 
     col_fc1, col_fc2 = st.columns(2)
