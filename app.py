@@ -32,7 +32,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from transform_attendance import load_grid, parse_grid, write_workbook, RAW_SHEET_DEFAULT
-from kpis import (build_frames, weekly_rollup, monthly_rollup, summary_stats, trailing_window_stats,
+from kpis import (build_frames, weekly_rollup, summary_stats, trailing_window_stats,
                    payor_composition, los_by_discharge_month, active_patient_stats,
                    WINDOWS, DEFAULT_INACTIVITY_DAYS)
 from chat_tools import answer_question
@@ -109,7 +109,7 @@ def cached_previous_snapshot(file_bytes: bytes, filename: str, gist_id: str):
 
 @st.cache_data(show_spinner=False)
 def load_forecast_baseline():
-    """Frozen N24M forecast (base case + growth case), generated once from
+    """Frozen N24M forecast (base case + go-big case), generated once from
     N24M_Revenue_Projection.xlsx and checked into the repo -- see
     extract_n24m_baseline.py. In production this file would be regenerated
     by Finance on a regular cadence, not on every dashboard load; the
@@ -492,25 +492,32 @@ else:
         f"doesn't split census/revenue by payor at the output level."
     )
 
-    monthly_all = monthly_rollup(sessions_df, patients_df, payor=None)
-    monthly_all = monthly_all.rename(columns={"month_label": "month_str"})
-
+    # Weekly grain throughout -- matches the Trend section's cadence and
+    # gives a much more legible variance read than a 24-point monthly bar
+    # chart would (a single bad/good week doesn't get smeared across a
+    # whole month before it's visible).
     fc_months = forecast["months"]
-    base = forecast["base_case"]
-    growth = forecast["growth_case"]
+    fc_start = pd.Timestamp(fc_months[0] + "-01")
+    fc_end = pd.Timestamp(fc_months[-1] + "-01") + pd.offsets.MonthEnd(1)
+    first_monday = fc_start - pd.Timedelta(days=fc_start.weekday())
+    fc_weeks = pd.date_range(first_monday, fc_end, freq="7D")
 
-    plot_df = pd.DataFrame({
-        "month": fc_months,
-        "base_revenue": base["total_revenue"],
-        "growth_revenue": growth["total_revenue"],
-        "base_census": base["census"],
-        "growth_census": growth["census"],
-    })
+    fc_rows = []
+    for wk in fc_weeks:
+        wk_end = wk + pd.Timedelta(days=6)
+        fc_rows.append({
+            "week": wk,
+            "base_revenue": forecast_window_estimate(forecast, "base_case", "total_revenue", wk, wk_end),
+            "growth_revenue": forecast_window_estimate(forecast, "growth_case", "total_revenue", wk, wk_end),
+            "base_census": forecast_window_estimate(forecast, "base_case", "census", wk, wk_end),
+            "growth_census": forecast_window_estimate(forecast, "growth_case", "census", wk, wk_end),
+        })
+    plot_df = pd.DataFrame(fc_rows)
     plot_df = plot_df.merge(
-        monthly_all[["month_str", "revenue", "census"]].rename(
-            columns={"month_str": "month", "revenue": "actual_revenue", "census": "actual_census"}
+        weekly_df_all[["week", "revenue", "patients_in_treatment"]].rename(
+            columns={"revenue": "actual_revenue", "patients_in_treatment": "actual_census"}
         ),
-        on="month", how="left",
+        on="week", how="left",
     )
     plot_df["variance_revenue"] = plot_df["actual_revenue"] - plot_df["base_revenue"]
 
@@ -519,43 +526,47 @@ else:
         st.caption(
             "No actuals fall inside the forecast window (Apr 2021 onward) "
             "yet -- the base sample dataset runs Aug 2020-Mar 2021, right "
-            "up to the forecast's start. Upload the April or September "
-            "test dataset (sidebar) to see actuals plotted against the "
-            "forecast a month or five months into the projection period."
+            "up to the forecast's start. Switch to the April or September "
+            "preset (sidebar) to see actuals plotted against the forecast "
+            "a few weeks or several months into the projection period."
         )
 
     col_fc1, col_fc2 = st.columns(2)
     with col_fc1:
-        st.markdown("**Revenue -- actual vs. forecast**")
-        fig = line_chart(plot_df, "month", [
+        st.markdown("**Revenue -- actual vs. forecast, weekly**")
+        fig = line_chart(plot_df, "week", [
             ("actual_revenue", "Actual", "#1baf7a", None, "lines+markers"),
             ("base_revenue", "Base case", "#2a78d6", "dash", "lines"),
-            ("growth_revenue", "Growth case (+2 reps)", "#7f77dd", "dot", "lines"),
+            ("growth_revenue", "Go-big case (staged hiring)", "#7f77dd", "dot", "lines"),
         ], "Revenue ($)")
         st.plotly_chart(fig, width="stretch")
     with col_fc2:
-        st.markdown("**Census -- actual vs. forecast**")
-        fig = line_chart(plot_df, "month", [
+        st.markdown("**Census -- actual vs. forecast, weekly**")
+        fig = line_chart(plot_df, "week", [
             ("actual_census", "Actual", "#1baf7a", None, "lines+markers"),
             ("base_census", "Base case", "#2a78d6", "dash", "lines"),
-            ("growth_census", "Growth case (+2 reps)", "#7f77dd", "dot", "lines"),
+            ("growth_census", "Go-big case (staged hiring)", "#7f77dd", "dot", "lines"),
         ], "Patients in treatment")
         st.plotly_chart(fig, width="stretch")
 
     if n_actual > 0:
-        st.markdown("**Revenue variance vs. base case** -- actual minus base-case forecast, by month")
+        st.markdown("**Revenue variance vs. base case, weekly** -- actual minus base-case forecast")
         variance_df = plot_df[plot_df["actual_revenue"].notna()]
         fig = bar_chart(
-            variance_df, "month", "variance_revenue", "Variance ($)",
+            variance_df, "week", "variance_revenue", "Variance ($)",
             color="#1baf7a",
         )
         st.plotly_chart(fig, width="stretch")
         st.caption(
             "Positive = ahead of the base-case forecast; negative = behind "
-            "it. Compared against base case (not growth case) since the "
-            "rep-headcount increase behind the growth case hasn't actually "
-            "been executed against yet -- base case is the fairer bar for "
-            "'are we tracking as expected' until that changes."
+            "it. Weekly base-case revenue here is the monthly N24M figure "
+            "prorated by day-count, not a separately modeled weekly number "
+            "-- so a short first/last week of a month shows a smaller "
+            "forecast bar, by design. Compared against base case (not "
+            "go-big case) since the rep-headcount increase behind the "
+            "go-big case hasn't actually been executed against yet -- base "
+            "case is the fairer bar for 'are we tracking as expected' "
+            "until that changes."
         )
 
 st.divider()

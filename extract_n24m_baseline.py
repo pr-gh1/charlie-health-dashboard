@@ -31,7 +31,7 @@ def read_row(r, ncols=24, first_col=3):
     return [ws.cell(row=r, column=first_col + i).value for i in range(ncols)]
 
 base_start = find_row("Base case (rep headcount")
-growth_start = find_row("Growth case (+")
+growth_start = find_row("Go-big case (staged")
 
 month_row = find_row("Month", base_start)
 months = [str(m) for m in read_row(month_row)]
