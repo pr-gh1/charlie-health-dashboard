@@ -392,9 +392,12 @@ with col_b:
     ], "Attendance rate", pct=True)
     st.plotly_chart(fig, width="stretch")
     st.caption(
-        "OPT runs far fewer sessions/week than IOP, so its rate (amber, "
-        "dashed, markers) is noisier -- read it as a rougher signal, not "
-        "a precise trend the way the IOP line is."
+        "Individual rate: each patient's own attended/scheduled ratio that "
+        "week, averaged across patients -- not a pooled ratio of total "
+        "attended over total scheduled sessions. OPT runs far fewer "
+        "sessions/week than IOP, so its rate (amber, dashed, markers) is "
+        "noisier -- read it as a rougher signal, not a precise trend the "
+        "way the IOP line is."
     )
 
 st.markdown("**Revenue & billing** -- is that engine converting to dollars?")
@@ -413,10 +416,14 @@ active_stats = active_patient_stats(sessions_df, patients_df, payor=los_payor)
 if los_trend.empty:
     st.caption("Not enough completed episodes yet to trend LOS.")
 else:
-    fig = bar_chart(los_trend, "discharge_month", "avg_los_weeks", "Avg LOS at discharge (weeks)", color="#7f77dd")
+    fig = bar_chart(los_trend, "discharge_month", "avg_los_appointments", "Avg LOS at discharge (appointments attended)", color="#7f77dd")
     st.plotly_chart(fig, width="stretch")
     st.caption(
-        f"Completed episodes only (last session {DEFAULT_INACTIVITY_DAYS}+ days before the data's most "
+        f"LOS = number of appointments ATTENDED per patient stay -- the "
+        f"billing-relevant measure of treatment received, not a calendar-time "
+        f"span (which conflates episode length with scheduling gaps). "
+        f"Completed episodes only (last attended session "
+        f"{DEFAULT_INACTIVITY_DAYS}+ days before the data's most "
         f"recent date) -- a patient still actively attending doesn't have a "
         f"finished LOS yet, so including them would bias recent months down. "
         f"Separately: {active_stats['count']} patients are currently active"
@@ -436,16 +443,18 @@ col_e, col_f = st.columns(2)
 with col_e:
     st.markdown("**Length of stay distribution**")
     fig = go.Figure()
-    fig.add_trace(go.Histogram(x=patients_df["los_weeks"], nbinsx=20, marker_color="#2a78d6"))
-    fig.add_vline(x=10, line_dash="dash", line_color="gray", annotation_text="~10wk typical program")
-    fig.update_layout(xaxis_title="LOS (weeks)", yaxis_title="Patients", height=260, margin=dict(t=10, l=10, r=10, b=10))
+    fig.add_trace(go.Histogram(x=patients_df["los_appointments"], nbinsx=20, marker_color="#2a78d6"))
+    median_appts = patients_df["los_appointments"].median()
+    fig.add_vline(x=median_appts, line_dash="dash", line_color="gray",
+                  annotation_text=f"median: {median_appts:.0f} appts")
+    fig.update_layout(xaxis_title="LOS (appointments attended)", yaxis_title="Patients", height=260, margin=dict(t=10, l=10, r=10, b=10))
     st.plotly_chart(fig, width="stretch")
 with col_f:
     st.markdown("**Payor mix** -- close to a 1.5x spread in billed rate")
     comp_df = payor_composition(sessions_df, patients_df)
     st.dataframe(
         comp_df.rename(columns={
-            "payor": "Payor", "patients": "Patients", "avg_los_weeks": "Avg LOS (wks)",
+            "payor": "Payor", "patients": "Patients", "avg_los_appointments": "Avg LOS (appts)",
             "attendance_rate": "Attendance rate", "total_revenue": "Total revenue",
             "avg_billed_iop_rate": "Avg billed IOP rate",
         }),

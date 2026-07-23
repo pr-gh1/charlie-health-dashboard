@@ -36,11 +36,11 @@ TOOLS = [
                 "payor": {"type": "string", "enum": ["All", "Commercial", "Medicaid"]},
                 "min_attendance_rate": {"type": "number"},
                 "max_attendance_rate": {"type": "number"},
-                "min_los_weeks": {"type": "number"},
-                "max_los_weeks": {"type": "number"},
+                "min_los_appointments": {"type": "number"},
+                "max_los_appointments": {"type": "number"},
                 "sort_by": {
                     "type": "string",
-                    "enum": ["attendance_rate", "los_weeks", "total_revenue",
+                    "enum": ["attendance_rate", "los_appointments", "total_revenue",
                              "scheduled_sessions", "first_session_date"],
                     "default": "attendance_rate",
                 },
@@ -114,24 +114,23 @@ def _tool_list_patients(sessions_df, patients_df, **kw):
         p = p[p["attendance_rate"] >= kw["min_attendance_rate"]]
     if kw.get("max_attendance_rate") is not None:
         p = p[p["attendance_rate"] <= kw["max_attendance_rate"]]
-    if kw.get("min_los_weeks") is not None:
-        p = p[p["los_weeks"] >= kw["min_los_weeks"]]
-    if kw.get("max_los_weeks") is not None:
-        p = p[p["los_weeks"] <= kw["max_los_weeks"]]
+    if kw.get("min_los_appointments") is not None:
+        p = p[p["los_appointments"] >= kw["min_los_appointments"]]
+    if kw.get("max_los_appointments") is not None:
+        p = p[p["los_appointments"] <= kw["max_los_appointments"]]
 
     sort_by = kw.get("sort_by", "attendance_rate")
     ascending = kw.get("ascending", True)
     limit = min(kw.get("limit", 10) or 10, MAX_LIST_LIMIT)
     p = p.sort_values(sort_by, ascending=ascending).head(limit)
 
-    cols = ["patient_id", "payor", "attendance_rate", "los_weeks",
+    cols = ["patient_id", "payor", "attendance_rate", "los_appointments",
             "scheduled_sessions", "attended_sessions", "total_revenue",
             "first_session_date", "last_session_date"]
     out = p[cols].copy()
     for c in ("first_session_date", "last_session_date"):
         out[c] = out[c].dt.strftime("%Y-%m-%d")
     out["attendance_rate"] = out["attendance_rate"].round(3)
-    out["los_weeks"] = out["los_weeks"].round(1)
     out["total_revenue"] = out["total_revenue"].round(2)
     return out.to_dict(orient="records")
 
@@ -188,7 +187,7 @@ def _tool_aggregate_stats(sessions_df, patients_df, **kw):
     s = _date_filter(s, kw.get("start_date"), kw.get("end_date"))
     p = filter_patients(patients_df, kw.get("payor"))
     if kw.get("start_date") or kw.get("end_date"):
-        # Scope "patients"/"avg_los_weeks" to those with activity in the
+        # Scope "patients"/"avg_los_appointments" to those with activity in the
         # window, not the whole payor cohort -- otherwise a Q1-only query
         # would silently report every Commercial patient ever seen.
         p = p[p["patient_id"].isin(s["patient_id"].unique())]
@@ -200,7 +199,7 @@ def _tool_aggregate_stats(sessions_df, patients_df, **kw):
         "attended_sessions": attended,
         "attendance_rate": round(attended / scheduled, 3) if scheduled else None,
         "total_revenue": round(float(s["revenue"].sum()), 2),
-        "avg_los_weeks": round(float(p["los_weeks"].mean()), 1) if len(p) else None,
+        "avg_los_appointments": round(float(p["los_appointments"].mean()), 1) if len(p) else None,
         "patients": int(p["patient_id"].nunique()),
     }
 

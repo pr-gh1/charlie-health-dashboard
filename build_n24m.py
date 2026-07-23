@@ -4,9 +4,11 @@ build_n24m.py
 N24M (next 24 months) IOP revenue projection model, built directly in
 Excel formulas per the case study's submission format (<200 rows, not
 lines of code). Two payor tracks (Commercial, Medicaid), rep-driven
-admissions (per the case study's B2B outreach-rep hint), a 3-month
-(~14wk) LOS lag for discharges, base case vs. growth case (added reps,
-ramping in), reporting IOP / OPT / total revenue.
+admissions (per the case study's B2B outreach-rep hint), a LOS lag for
+discharges derived from actual attended-appointment duration (most
+recent completed cohort, not scheduled/booked dates), base case vs.
+growth case (added reps, ramping in), reporting IOP / OPT / total
+revenue.
 
 All starting assumptions are pulled from the real base dataset via
 kpis.py, not invented.
@@ -18,7 +20,7 @@ from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 import datetime
 from transform_attendance import load_grid, parse_grid
-from kpis import build_frames, classify_episodes
+from kpis import build_frames, classify_episodes, los_by_discharge_month
 import pandas as pd
 
 grid, wb0 = load_grid("sample_data/sample_attendance_export.xlsx")
@@ -67,8 +69,20 @@ ADMITS_PER_REP = round(base_admit_rate / REPS_BASE, 4)
 REPS_PER_WAVE = 5
 RAMP_LEN = 3
 WAVE_STARTS = [4, 10, 16]  # month index (1-based) each wave's ramp begins
-LOS_MONTHS = 3
+
+# LOS: the headline KPI is number of appointments ATTENDED per patient stay
+# (not a calendar-time span, which conflates episode length with scheduling
+# gaps) -- for the most recent fully-completed discharge cohort, derived
+# from the real data via kpis.los_by_discharge_month(), not hardcoded.
+# The month-based lag below (LOS_MONTHS) is a separate, internal timing
+# parameter this monthly model structurally needs to know when to roll a
+# cohort off census -- it is NOT the reported LOS KPI, just derived from
+# the same cohort's calendar span for internal consistency.
+_los_trend = los_by_discharge_month(sessions_df, patients_df)
+LOS_APPOINTMENTS_MOST_RECENT_COHORT = float(_los_trend.iloc[-1]["avg_los_appointments"])
+LOS_WEEKS_MOST_RECENT_COHORT = float(_los_trend.iloc[-1]["avg_los_weeks"])
 WEEKS_PER_MONTH = 4.345
+LOS_MONTHS = round(LOS_WEEKS_MOST_RECENT_COHORT / WEEKS_PER_MONTH)
 
 MONTHS = pd.period_range("2021-04", periods=24, freq="M")
 
@@ -114,7 +128,11 @@ for wi, wave_month in enumerate(WAVE_STARTS, start=1):
     label = f"Growth case: wave {wi} start month (1-24)"
     add_assum(label, wave_month, "0")
     wave_labels.append(label)
-add_assum("LOS (months, ~14wk, most recent cohort)", LOS_MONTHS, "0")
+add_assum(
+    f"LOS -- reported KPI: {LOS_APPOINTMENTS_MOST_RECENT_COHORT:.1f} appointments attended "
+    f"(most recent cohort). Discharge-timing lag below (months)",
+    LOS_MONTHS, "0",
+)
 add_assum("Commercial admit mix", round(comm_mix, 4), "0.0%")
 add_assum("Medicaid admit mix", round(med_mix, 4), "0.0%")
 add_assum("Starting census -- Commercial (as of Mar 2021)", census0_comm, "0")
@@ -131,6 +149,21 @@ add_assum("Weeks per month", WEEKS_PER_MONTH, "0.000")
 add_assum("Historical admits Jan 2021 (lookback for discharge lag)", lookback[0], "0")
 add_assum("Historical admits Feb 2021 (lookback for discharge lag)", lookback[1], "0")
 add_assum("Historical admits Mar 2021 (lookback for discharge lag)", lookback[2], "0")
+ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=26)
+cell(
+    r, 1,
+    "Flag: these three lookback months are genuinely 0 in the source data -- "
+    "not a placeholder. Admissions were flat at zero for the full quarter "
+    "immediately before this forecast starts, which sits inside the "
+    "\"Admissions per rep per month\" assumption above (an 8-month average "
+    "that blends this flat quarter in with five earlier, busier months). "
+    "If the flat quarter reflects a genuine new demand level rather than "
+    "one-off noise, the base case is optimistic -- see Assumptions & "
+    "Limitations doc for the full discussion.",
+    Font(italic=True, size=9, color="C00000"),
+)
+ws.row_dimensions[r].height = 28
+r += 1
 r += 1
 
 A = lambda label: f"$B${assum_row[label]}"
@@ -171,6 +204,22 @@ def build_scenario(label, is_growth):
         cell(r, c, f, fmt="0.00")
     r += 1
 
+    if is_growth:
+        note = ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=26)
+        cell(
+            r, 1,
+            "Plain-English: reps = base headcount, plus each wave's contribution. "
+            "Each wave ramps from 0 to full size (B7) over the ramp length (B8), "
+            "starting at that wave's own start month (B9/B10/B11) -- "
+            "MIN(MAX((month-start+1)/ramp,0),1) is just \"0 before the wave starts, "
+            "rises in a straight line during the ramp, holds at 1 (fully ramped) "
+            "forever after\" -- so a wave that's already ramped doesn't ramp again, "
+            "and a wave that hasn't started yet doesn't contribute early.",
+            Font(italic=True, size=9, color="595959"),
+        )
+        ws.row_dimensions[r].height = 28
+        r += 1
+
     admits_row = r
     cell(r, 1, "Total admits")
     for i in range(24):
@@ -193,7 +242,7 @@ def build_scenario(label, is_growth):
     r += 1
 
     disch_c_row = r
-    cell(r, 1, "Discharges -- Commercial (=admits 3mo prior)")
+    cell(r, 1, f"Discharges -- Commercial (=admits {LOS_MONTHS}mo prior)")
     for i in range(24):
         c = FIRST_COL + i; col_l = get_column_letter(c)
         src_i = i - LOS_MONTHS
@@ -206,7 +255,7 @@ def build_scenario(label, is_growth):
             cell(r, c, f"={src_col}{admits_c_row}", fmt="0.00")
     r += 1
     disch_m_row = r
-    cell(r, 1, "Discharges -- Medicaid (=admits 3mo prior)")
+    cell(r, 1, f"Discharges -- Medicaid (=admits {LOS_MONTHS}mo prior)")
     for i in range(24):
         c = FIRST_COL + i; col_l = get_column_letter(c)
         src_i = i - LOS_MONTHS

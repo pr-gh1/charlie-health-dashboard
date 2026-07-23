@@ -38,9 +38,40 @@ def build_frames(rates, sessions, patients):
         opt_attended=("attended", lambda s: s[sessions_df.loc[s.index, "session_type"] == "OPT"].sum()),
         total_revenue=("revenue", "sum"),
     ).reset_index()
-    agg["los_days"] = (agg["last_session_date"] - agg["first_session_date"]).dt.days
+
+    # LOS: duration between a patient's FIRST and LAST ATTENDED appointment,
+    # not first/last scheduled entry. Using all scheduled sessions (the
+    # original approach) lets a booked-but-never-attended or no-show
+    # appointment stretch a patient's measured stay past when they actually
+    # last showed up -- LOS should reflect actual attended duration, per the
+    # appointment record itself, not the calendar span of the booking log.
+    attended_only = sessions_df[sessions_df["attended"] == 1]
+    los_dates = attended_only.groupby("patient_id").agg(
+        first_attended_date=("date", "min"),
+        last_attended_date=("date", "max"),
+    ).reset_index()
+    agg = agg.merge(los_dates, on="patient_id", how="left")
+    agg["los_days"] = (agg["last_attended_date"] - agg["first_attended_date"]).dt.days
     agg["los_weeks"] = agg["los_days"] / 7
+
+    # Attendance rate: each patient's OWN attended/scheduled ratio. This is
+    # the individual (patient-level) rate -- kept distinct from a pooled/
+    # blended rate (total attended sessions / total scheduled sessions
+    # across all patients), which the downstream weekly/trailing/payor
+    # views used to compute instead. Reporting should average these
+    # individual rates, not pool the underlying counts first.
     agg["attendance_rate"] = agg["attended_sessions"] / agg["scheduled_sessions"]
+
+    # LOS, the headline KPI: number of appointments ATTENDED per patient
+    # stay -- not a calendar-time span. Appointment count is the stable,
+    # billing-relevant measure of how much treatment someone actually
+    # received; calendar weeks conflates that with scheduling gaps (holidays,
+    # attendance cadence, etc.) that don't reflect episode length. los_days/
+    # los_weeks are still computed below and kept on the table, but only as
+    # an internal timing figure for the N24M and Part 2 models (which need a
+    # calendar-time discharge lag) -- they are not the reported LOS KPI.
+    agg["los_appointments"] = agg["attended_sessions"]
+
     patients_df = patients_df.merge(agg, on="patient_id", how="left")
 
     return rates_df, sessions_df, patients_df
@@ -110,9 +141,30 @@ def weekly_rollup(sessions_df, patients_df, payor=None):
     weekly = weekly.merge(iop, on="week", how="left").merge(opt, on="week", how="left")
     weekly = weekly.merge(iop_patients, on="week", how="left")
     weekly["iop_patients"] = weekly["iop_patients"].fillna(0).astype(int)
-    weekly["attendance_rate"] = weekly["attended_sessions"] / weekly["scheduled_sessions"]
-    weekly["iop_attendance_rate"] = weekly["iop_attended"] / weekly["iop_scheduled"]
-    weekly["opt_attendance_rate"] = weekly["opt_attended"] / weekly["opt_scheduled"]
+
+    # Individual attendance rate: each patient's own attended/scheduled
+    # ratio for the week, averaged across patients -- not a pooled ratio of
+    # total attended / total scheduled sessions across everyone. A pooled
+    # rate is silently weighted toward whichever patients had the most
+    # sessions that week; the individual average treats every patient's
+    # attendance equally regardless of their volume.
+    def _individual_rate(frame, type_filter=None):
+        f = frame if type_filter is None else frame[frame.session_type == type_filter]
+        per_patient = f.groupby(["week", "patient_id"]).agg(
+            scheduled=("date", "count"), attended=("attended", "sum")
+        ).reset_index()
+        per_patient["rate"] = per_patient["attended"] / per_patient["scheduled"]
+        return per_patient.groupby("week")["rate"].mean().reset_index()
+
+    weekly = weekly.merge(
+        _individual_rate(s).rename(columns={"rate": "attendance_rate"}), on="week", how="left"
+    )
+    weekly = weekly.merge(
+        _individual_rate(s, "IOP").rename(columns={"rate": "iop_attendance_rate"}), on="week", how="left"
+    )
+    weekly = weekly.merge(
+        _individual_rate(s, "OPT").rename(columns={"rate": "opt_attendance_rate"}), on="week", how="left"
+    )
     weekly["avg_billed_iop_rate"] = weekly["iop_revenue"] / weekly["iop_attended"]
     weekly["avg_daily_revenue"] = weekly["revenue"] / 7
 
@@ -189,6 +241,18 @@ def trailing_window_stats(sessions_df, patients_df, window_days, payor=None, as_
     revenue = float(win["revenue"].sum())
     iop_revenue = float(iop["revenue"].sum())
 
+    # Individual (per-patient) attendance rate, averaged -- not pooled
+    # attended/scheduled counts. See weekly_rollup()'s _individual_rate for
+    # the same logic applied per-week instead of per-window.
+    def _individual_rate(frame):
+        if frame.empty:
+            return None
+        per_patient = frame.groupby("patient_id").agg(
+            scheduled=("date", "count"), attended=("attended", "sum")
+        )
+        rate = (per_patient["attended"] / per_patient["scheduled"]).mean()
+        return round(float(rate), 3)
+
     patients_in_treatment = int(((p["first_session_date"] <= end) & (p["last_session_date"] >= start)).sum())
     new_admissions = int(((p["first_session_date"] >= start) & (p["first_session_date"] <= end)).sum())
 
@@ -200,8 +264,8 @@ def trailing_window_stats(sessions_df, patients_df, window_days, payor=None, as_
         "patients_in_treatment": patients_in_treatment,
         "new_admissions": new_admissions,
         "iop_patients": iop_patient_count,
-        "iop_attendance_rate": round(iop_attended / iop_scheduled, 3) if iop_scheduled else None,
-        "opt_attendance_rate": round(opt_attended / opt_scheduled, 3) if opt_scheduled else None,
+        "iop_attendance_rate": _individual_rate(iop),
+        "opt_attendance_rate": _individual_rate(opt),
         "billable_iop_sessions": iop_attended,
         "avg_billed_iop_rate": round(iop_revenue / iop_attended, 2) if iop_attended else None,
         "avg_daily_revenue": round(revenue / window_days, 2),
@@ -229,23 +293,31 @@ def classify_episodes(patients_df, sessions_df, inactivity_days=DEFAULT_INACTIVI
     cutoff = max_date - pd.Timedelta(days=inactivity_days)
     p = patients_df.copy()
     p["episode_status"] = "active"
-    p.loc[p["last_session_date"] < cutoff, "episode_status"] = "completed"
+    # Keyed off last ATTENDED date, matching the LOS fix -- a stale future
+    # scheduled entry that was never attended shouldn't make a patient look
+    # "still active," and vice versa.
+    p.loc[p["last_attended_date"] < cutoff, "episode_status"] = "completed"
     return p
 
 
 def los_by_discharge_month(sessions_df, patients_df, payor=None, inactivity_days=DEFAULT_INACTIVITY_DAYS):
-    """Avg LOS trended by discharge month, completed episodes only -- see
-    classify_episodes() for why active (still-running) episodes are
-    excluded rather than averaged in."""
+    """Avg LOS (appointments attended) trended by discharge month, completed
+    episodes only -- see classify_episodes() for why active (still-running)
+    episodes are excluded rather than averaged in. Also carries avg_los_weeks
+    alongside as a secondary/reference figure -- not the headline KPI, but
+    needed by the N24M and Part 2 models for their calendar-time discharge
+    lag."""
     p = filter_patients(classify_episodes(patients_df, sessions_df, inactivity_days), payor)
     completed = p[p["episode_status"] == "completed"].copy()
     if completed.empty:
-        return pd.DataFrame(columns=["discharge_month", "avg_los_weeks", "patients"])
-    completed["discharge_month"] = completed["last_session_date"].dt.to_period("M").dt.to_timestamp()
+        return pd.DataFrame(columns=["discharge_month", "avg_los_appointments", "avg_los_weeks", "patients"])
+    completed["discharge_month"] = completed["last_attended_date"].dt.to_period("M").dt.to_timestamp()
     monthly = completed.groupby("discharge_month").agg(
+        avg_los_appointments=("los_appointments", "mean"),
         avg_los_weeks=("los_weeks", "mean"),
         patients=("patient_id", "count"),
     ).reset_index()
+    monthly["avg_los_appointments"] = monthly["avg_los_appointments"].round(1)
     monthly["avg_los_weeks"] = monthly["avg_los_weeks"].round(1)
     return monthly.sort_values("discharge_month")
 
@@ -259,7 +331,7 @@ def active_patient_stats(sessions_df, patients_df, payor=None, inactivity_days=D
     if active.empty:
         return {"count": 0, "avg_tenure_weeks": None}
     max_date = sessions_df["date"].max()
-    tenure_weeks = (max_date - active["first_session_date"]).dt.days / 7
+    tenure_weeks = (max_date - active["first_attended_date"]).dt.days / 7
     return {"count": int(len(active)), "avg_tenure_weeks": round(float(tenure_weeks.mean()), 1)}
 
 
@@ -274,11 +346,14 @@ def payor_composition(sessions_df, patients_df):
         p = patients_df[patients_df["payor"] == payor]
         s = sessions_df[sessions_df["payor"] == payor]
         iop_attended = s[(s.session_type == "IOP") & (s.attended == 1)]
+        # Individual attendance rate: mean of each patient's own rate
+        # (already computed per-patient in build_frames), not pooled
+        # attended/scheduled counts across the payor group.
         rows.append({
             "payor": payor,
             "patients": int(len(p)),
-            "avg_los_weeks": round(float(p["los_weeks"].mean()), 1),
-            "attendance_rate": round(float(s["attended"].sum() / len(s)), 3) if len(s) else None,
+            "avg_los_appointments": round(float(p["los_appointments"].mean()), 1),
+            "attendance_rate": round(float(p["attendance_rate"].mean()), 3) if len(p) else None,
             "total_revenue": round(float(s["revenue"].sum()), 2),
             "avg_billed_iop_rate": round(float(iop_attended["revenue"].sum() / len(iop_attended)), 2)
             if len(iop_attended) else None,
@@ -320,7 +395,7 @@ def summary_stats(sessions_df, patients_df, weekly_df):
             "scheduled_sessions": int(len(sessions_df)),
             "attended_sessions": int(sessions_df["attended"].sum()),
             "total_revenue": round(float(sessions_df["revenue"].sum()), 2),
-            "avg_los_weeks": round(float(patients_df["los_weeks"].mean()), 1),
+            "avg_los_appointments": round(float(patients_df["los_appointments"].mean()), 1),
         },
         "payor_mix": {
             payor: int(count)
