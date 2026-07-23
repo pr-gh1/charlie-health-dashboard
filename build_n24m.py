@@ -20,7 +20,7 @@ from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 import datetime
 from transform_attendance import load_grid, parse_grid
-from kpis import build_frames, classify_episodes, los_by_discharge_month
+from kpis import build_frames, classify_episodes, los_by_discharge_month, weekly_rollup
 import pandas as pd
 
 grid, wb0 = load_grid("sample_data/sample_attendance_export.xlsx")
@@ -70,19 +70,28 @@ REPS_PER_WAVE = 5
 RAMP_LEN = 3
 WAVE_STARTS = [4, 10, 16]  # month index (1-based) each wave's ramp begins
 
-# LOS: the headline KPI is number of appointments ATTENDED per patient stay
-# (not a calendar-time span, which conflates episode length with scheduling
-# gaps) -- for the most recent fully-completed discharge cohort, derived
-# from the real data via kpis.los_by_discharge_month(), not hardcoded.
-# The month-based lag below (LOS_MONTHS) is a separate, internal timing
-# parameter this monthly model structurally needs to know when to roll a
-# cohort off census -- it is NOT the reported LOS KPI, just derived from
-# the same cohort's calendar span for internal consistency.
+# LOS: the headline KPI, and the thing this model is actually anchored on,
+# is number of appointments ATTENDED per patient stay (most recent
+# fully-completed discharge cohort, from kpis.los_by_discharge_month()).
+# This monthly cash-flow model still needs a month-count to know when to
+# roll a cohort off census -- LOS_MONTHS below -- but that figure is now
+# DERIVED from the appointment count (divided by a population-level
+# appointments/week throughput rate, itself measured cross-sectionally as
+# total attended sessions / total patient-weeks-in-treatment across the
+# whole dataset, via kpis.weekly_rollup() -- NOT by measuring any single
+# cohort's calendar span directly). Appointments in, months out; not the
+# other way around.
 _los_trend = los_by_discharge_month(sessions_df, patients_df)
 LOS_APPOINTMENTS_MOST_RECENT_COHORT = float(_los_trend.iloc[-1]["avg_los_appointments"])
-LOS_WEEKS_MOST_RECENT_COHORT = float(_los_trend.iloc[-1]["avg_los_weeks"])
+
+_weekly = weekly_rollup(sessions_df, patients_df)
+APPOINTMENTS_PER_PATIENT_PER_WEEK = float(
+    _weekly["attended_sessions"].sum() / _weekly["patients_in_treatment"].sum()
+)
 WEEKS_PER_MONTH = 4.345
-LOS_MONTHS = round(LOS_WEEKS_MOST_RECENT_COHORT / WEEKS_PER_MONTH)
+LOS_MONTHS = round(
+    LOS_APPOINTMENTS_MOST_RECENT_COHORT / (APPOINTMENTS_PER_PATIENT_PER_WEEK * WEEKS_PER_MONTH)
+)
 
 MONTHS = pd.period_range("2021-04", periods=24, freq="M")
 
@@ -129,8 +138,15 @@ for wi, wave_month in enumerate(WAVE_STARTS, start=1):
     add_assum(label, wave_month, "0")
     wave_labels.append(label)
 add_assum(
-    f"LOS -- reported KPI: {LOS_APPOINTMENTS_MOST_RECENT_COHORT:.1f} appointments attended "
-    f"(most recent cohort). Discharge-timing lag below (months)",
+    "LOS -- reported KPI (appointments attended, most recent cohort)",
+    round(LOS_APPOINTMENTS_MOST_RECENT_COHORT, 1), "0.0",
+)
+add_assum(
+    "Appointments per patient per week (population rate, all patients)",
+    round(APPOINTMENTS_PER_PATIENT_PER_WEEK, 3), "0.000",
+)
+add_assum(
+    "Discharge-timing lag (months) = LOS appointments / (appts/wk x wks/mo)",
     LOS_MONTHS, "0",
 )
 add_assum("Commercial admit mix", round(comm_mix, 4), "0.0%")

@@ -304,9 +304,21 @@ def write_workbook(output_path, rates, sessions, patients, source_wb, sheet_name
     sess_last_row = len(sessions) + 1
 
     # --- Patients tab (dimension: one row per patient) ---
+    # LOS -- the headline KPI -- is los_appointments (col K): number of
+    # appointments ATTENDED per patient stay, not a calendar-time span
+    # (which conflates episode length with scheduling gaps). los_days/
+    # los_weeks (cols G/H) are measured between a patient's first and last
+    # ATTENDED appointment (cols E/F, not first/last scheduled entry in
+    # cols C/D, which could include no-shows) and are kept only as a
+    # secondary/internal figure -- other models in this workbook need a
+    # calendar-time discharge lag, not the appointment count itself.
+    # attendance_rate (col L) is each patient's own attended/scheduled
+    # ratio -- already individual, not pooled.
     pat_ws = out_wb.create_sheet("Patients")
     pat_headers = ["patient_id", "payor", "first_session_date", "last_session_date",
-                   "los_days", "los_weeks", "scheduled_sessions", "attended_sessions",
+                   "first_attended_date", "last_attended_date",
+                   "los_days", "los_weeks", "los_appointments",
+                   "scheduled_sessions", "attended_sessions",
                    "attendance_rate", "iop_attended", "opt_attended", "total_revenue"]
     pat_ws.append(pat_headers)
     for i, p in enumerate(patients, start=2):
@@ -322,24 +334,41 @@ def write_workbook(output_path, rates, sessions, patients, source_wb, sheet_name
                      value=f"=_xlfn.MAXIFS(Sessions!$D$2:$D${sess_last_row},"
                            f"Sessions!$A$2:$A${sess_last_row},A{i})")
         d_cell.number_format = "yyyy-mm-dd"
-        pat_ws.cell(row=i, column=5, value=f"=D{i}-C{i}")
-        pat_ws.cell(row=i, column=6, value=f"=E{i}/7")
-        pat_ws.cell(row=i, column=7,
-                     value=f"=COUNTIFS(Sessions!$A$2:$A${sess_last_row},A{i})")
-        pat_ws.cell(row=i, column=8,
+        e_cell = pat_ws.cell(row=i, column=5,
+                     value=f"=_xlfn.MINIFS(Sessions!$D$2:$D${sess_last_row},"
+                           f"Sessions!$A$2:$A${sess_last_row},A{i},"
+                           f"Sessions!$F$2:$F${sess_last_row},1)")
+        e_cell.number_format = "yyyy-mm-dd"
+        f_cell = pat_ws.cell(row=i, column=6,
+                     value=f"=_xlfn.MAXIFS(Sessions!$D$2:$D${sess_last_row},"
+                           f"Sessions!$A$2:$A${sess_last_row},A{i},"
+                           f"Sessions!$F$2:$F${sess_last_row},1)")
+        f_cell.number_format = "yyyy-mm-dd"
+        pat_ws.cell(row=i, column=7, value=f"=F{i}-E{i}")
+        pat_ws.cell(row=i, column=8, value=f"=G{i}/7")
+        # los_appointments -- the headline LOS KPI: number of appointments
+        # ATTENDED per patient stay (same underlying count as
+        # attended_sessions, column K, surfaced here under its KPI name
+        # right next to the secondary duration figures for discoverability).
+        pat_ws.cell(row=i, column=9,
                      value=f"=SUMIFS(Sessions!$F$2:$F${sess_last_row},"
                            f"Sessions!$A$2:$A${sess_last_row},A{i})")
-        pat_ws.cell(row=i, column=9, value=f"=IFERROR(H{i}/G{i},0)")
-        pat_ws.cell(row=i, column=9).number_format = "0.0%"
         pat_ws.cell(row=i, column=10,
+                     value=f"=COUNTIFS(Sessions!$A$2:$A${sess_last_row},A{i})")
+        pat_ws.cell(row=i, column=11,
+                     value=f"=SUMIFS(Sessions!$F$2:$F${sess_last_row},"
+                           f"Sessions!$A$2:$A${sess_last_row},A{i})")
+        pat_ws.cell(row=i, column=12, value=f"=IFERROR(K{i}/J{i},0)")
+        pat_ws.cell(row=i, column=12).number_format = "0.0%"
+        pat_ws.cell(row=i, column=13,
                      value=f"=SUMIFS(Sessions!$F$2:$F${sess_last_row},"
                            f"Sessions!$A$2:$A${sess_last_row},A{i},"
                            f"Sessions!$C$2:$C${sess_last_row},\"IOP\")")
-        pat_ws.cell(row=i, column=11,
+        pat_ws.cell(row=i, column=14,
                      value=f"=SUMIFS(Sessions!$F$2:$F${sess_last_row},"
                            f"Sessions!$A$2:$A${sess_last_row},A{i},"
                            f"Sessions!$C$2:$C${sess_last_row},\"OPT\")")
-        rev_cell = pat_ws.cell(row=i, column=12,
+        rev_cell = pat_ws.cell(row=i, column=15,
                      value=f"=SUMIFS(Sessions!$I$2:$I${sess_last_row},"
                            f"Sessions!$A$2:$A${sess_last_row},A{i})")
         rev_cell.number_format = "$#,##0"
@@ -352,7 +381,7 @@ def write_workbook(output_path, rates, sessions, patients, source_wb, sheet_name
     for ws, widths in (
         (rates_ws, [14, 12, 10]),
         (sess_ws, [14, 12, 14, 12, 10, 10, 10, 10, 12]),
-        (pat_ws, [14, 12, 18, 18, 10, 10, 18, 17, 15, 12, 12, 13]),
+        (pat_ws, [14, 12, 18, 18, 18, 18, 10, 10, 15, 18, 17, 15, 12, 12, 13]),
     ):
         for idx, w in enumerate(widths, start=1):
             ws.column_dimensions[get_column_letter(idx)].width = w

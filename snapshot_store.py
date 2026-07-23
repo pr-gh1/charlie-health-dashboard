@@ -90,7 +90,7 @@ def compute_diff(previous_stats, current_stats):
     changes = {
         "totals": _cmp_block(
             previous_stats.get("totals", {}), current_stats.get("totals", {}),
-            ["patients", "scheduled_sessions", "attended_sessions", "total_revenue", "avg_los_weeks"],
+            ["patients", "scheduled_sessions", "attended_sessions", "total_revenue", "avg_los_appointments"],
         ),
     }
     for window in ("L7D", "L1M", "L3M"):
@@ -109,7 +109,7 @@ def compute_diff(previous_stats, current_stats):
     for payor in sorted(set(prev_payor) | set(curr_payor)):
         by_payor[payor] = _cmp_block(
             prev_payor.get(payor, {}), curr_payor.get(payor, {}),
-            ["patients", "avg_los_weeks", "attendance_rate", "total_revenue", "avg_billed_iop_rate"],
+            ["patients", "avg_los_appointments", "attendance_rate", "total_revenue", "avg_billed_iop_rate"],
         )
     changes["by_payor"] = by_payor
 
